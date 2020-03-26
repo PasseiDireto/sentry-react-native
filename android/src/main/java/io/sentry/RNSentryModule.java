@@ -135,11 +135,220 @@ public class RNSentryModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
-    public void captureEnvelope(String envelope, Promise promise) {
-        try {
-            File installation = new File(sentryOptions.getOutboxPath(), UUID.randomUUID().toString());
-            try(FileOutputStream out = new FileOutputStream(installation)) {
-                out.write(envelope.getBytes(Charset.forName("UTF-8")));
+    public void deviceContexts(Promise promise) {
+        EventBuilder eventBuilder = new EventBuilder();
+        androidHelper.helpBuildingEvent(eventBuilder);
+        Event event = eventBuilder.build();
+
+        WritableMap params = Arguments.createMap();
+
+        for (Map.Entry<String, Map<String, Object>> data : event.getContexts().entrySet()) {
+            params.putMap(data.getKey(), MapUtil.toWritableMap(data.getValue()));
+        }
+
+        promise.resolve(params);
+    }
+
+    @ReactMethod
+    public void extraUpdated(ReadableMap extra) {
+        if (extra.hasKey("__sentry_release")) {
+            sentryClient.release = extra.getString("__sentry_release");
+        }
+        if (extra.hasKey("__sentry_dist")) {
+            sentryClient.dist = extra.getString("__sentry_dist");
+        }
+    }
+
+    @ReactMethod
+    public void sendEvent(ReadableMap event, Promise promise) {
+        ReadableNativeMap castEvent = (ReadableNativeMap)event;
+
+//        EventBuilder eventBuilder = new EventBuilder()
+//                .withLevel(eventLevel(castEvent));
+
+        EventBuilder eventBuilder;
+        if (event.hasKey("event_id")) {
+            UUID eventId = UUID.fromString(event.getString("event_id").replaceFirst(
+                    "(\\p{XDigit}{8})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}+)",
+                    "$1-$2-$3-$4-$5"));
+            eventBuilder = new EventBuilder(eventId).withLevel(eventLevel(castEvent));
+        } else {
+            logger.info("Event has no event_id");
+            eventBuilder = new EventBuilder().withLevel(eventLevel(castEvent));
+        }
+
+        androidHelper.helpBuildingEvent(eventBuilder);
+
+        if (event.hasKey("breadcrumbs")) {
+            ReadableNativeArray breadcrumbs = (ReadableNativeArray)event.getArray("breadcrumbs");
+            ArrayList<Breadcrumb> eventBreadcrumbs = new ArrayList<Breadcrumb>();
+            for (int i = 0; i < breadcrumbs.size(); i++) {
+                ReadableNativeMap breadcrumb = breadcrumbs.getMap(i);
+                BreadcrumbBuilder breadcrumbBuilder = new BreadcrumbBuilder();
+                if (breadcrumb.hasKey("category")) {
+                    breadcrumbBuilder.setCategory(breadcrumb.getString("category"));
+                }
+
+                if (breadcrumb.hasKey("type") && breadcrumb.getString("type") != null) {
+                    String typeString = breadcrumb.getString("type").toUpperCase();
+                    try {
+                        breadcrumbBuilder.setType(Breadcrumb.Type.valueOf(typeString));
+                    } catch (IllegalArgumentException e) {
+                        //don't copy over invalid breadcrumb 'type' value
+                    }
+                }
+
+                if (breadcrumb.hasKey("level") && breadcrumb.getString("level") != null) {
+                    String levelString = breadcrumb.getString("level").toUpperCase();
+                    try {
+                        breadcrumbBuilder.setLevel(Breadcrumb.Level.valueOf(levelString));
+                    } catch (IllegalArgumentException e) {
+                        //don't copy over invalid breadcrumb 'level' value
+                    }
+                }
+
+                try {
+                    if (breadcrumb.hasKey("data") && breadcrumb.getMap("data") != null) {
+                        Map<String, String> newData = new HashMap<>();
+                        for (Map.Entry<String, Object> data : breadcrumb.getMap("data").toHashMap().entrySet()) {
+                            newData.put(data.getKey(), data.getValue() != null ? data.getValue().toString() : null);
+                        }
+
+                        // in case a `status_code` entry got accidentally stringified as a float
+                        if (newData.containsKey("status_code")) {
+                              String value = newData.get("status_code");
+                              newData.put(
+                                  "status_code",
+                                  value.endsWith(".0") ? value.replace(".0", "") : value
+                              );
+                        }
+
+                        breadcrumbBuilder.setData(newData);
+                    }
+                } catch (UnexpectedNativeTypeException e) {
+                    logger.warning("Discarded breadcrumb.data since it was not an object");
+                } catch (ClassCastException e) { // This needs to be here for RN < 0.60
+                    logger.warning("Discarded breadcrumb.data since it was not an object");
+                }
+
+                if (breadcrumb.hasKey("message")) {
+                    breadcrumbBuilder.setMessage(breadcrumb.getString("message"));
+                } else {
+                    breadcrumbBuilder.setMessage("");
+                }
+                eventBreadcrumbs.add(i, breadcrumbBuilder.build());
+            }
+            if (eventBreadcrumbs.size() > 0) {
+                eventBuilder.withBreadcrumbs(eventBreadcrumbs);
+            }
+        }
+
+        if (event.hasKey("message")) {
+            String message = "";
+            try {
+                message = event.getString("message");
+            } catch (UnexpectedNativeTypeException e) {
+                // Do nothing
+            } catch (ClassCastException e) { // This needs to be here for RN < 0.60
+                // Do nothing
+            } finally {
+                try {
+                    message = event.getMap("message").toString();
+                } catch (UnexpectedNativeTypeException e) {
+                    // Do nothing
+                } catch (ClassCastException e) { // This needs to be here for RN < 0.60
+                    // Do nothing
+                }
+            }
+            eventBuilder.withMessage(message);
+        }
+
+        if (event.hasKey("logger")) {
+            eventBuilder.withLogger(event.getString("logger"));
+        }
+
+        if (event.hasKey("user")) {
+            UserBuilder userBuilder = getUserBuilder(event.getMap("user"));
+            User builtUser = userBuilder.build();
+            UserInterface userInterface = new UserInterface(
+                    builtUser.getId(),
+                    builtUser.getUsername(),
+                    null,
+                    builtUser.getEmail(),
+                    builtUser.getData()
+            );
+            eventBuilder.withSentryInterface(userInterface);
+        }
+
+        if (castEvent.hasKey("extra")) {
+            for (Map.Entry<String, Object> entry : castEvent.getMap("extra").toHashMap().entrySet()) {
+                eventBuilder.withExtra(entry.getKey(), entry.getValue());
+            }
+        }
+
+        if (event.hasKey("fingerprint")) {
+            ReadableArray fingerprint = event.getArray("fingerprint");
+            ArrayList<String> print = new ArrayList<String>(fingerprint.size());
+            for(int i = 0; i < fingerprint.size(); ++i) {
+                print.add(i, fingerprint.getString(i));
+            }
+            eventBuilder.withFingerprint(print);
+        }
+
+        if (castEvent.hasKey("tags")) {
+            for (Map.Entry<String, Object> entry : castEvent.getMap("tags").toHashMap().entrySet()) {
+                String tagValue = entry.getValue() != null ? entry.getValue().toString() : "INVALID_TAG";
+                eventBuilder.withTag(entry.getKey(), tagValue);
+            }
+        }
+
+        if (event.hasKey("exception")) {
+            ReadableNativeArray exceptionValues = (ReadableNativeArray)event.getMap("exception").getArray("values");
+            ReadableNativeMap exception = exceptionValues.getMap(0);
+            if (exception.hasKey("stacktrace")) {
+                ReadableNativeMap stacktrace = exception.getMap("stacktrace");
+                // temporary solution until final fix
+                // https://github.com/getsentry/sentry-react-native/issues/742
+                if (stacktrace.hasKey("frames")) {
+                    ReadableNativeArray frames = (ReadableNativeArray)stacktrace.getArray("frames");
+                    if (exception.hasKey("value")) {
+                        addExceptionInterface(eventBuilder, exception.getString("type"), exception.getString("value"), frames);
+                    } else {
+                        // We use type/type here since this indicates an Unhandled Promise Rejection
+                        // https://github.com/getsentry/react-native-sentry/issues/353
+                        addExceptionInterface(eventBuilder, exception.getString("type"), exception.getString("type"), frames);
+                    }
+                }
+            }
+        }
+
+        if (event.hasKey("environment")) {
+            eventBuilder.withEnvironment(event.getString("environment"));
+        }
+
+
+        if (event.hasKey("release")) {
+            eventBuilder.withRelease(event.getString("release"));
+        } else {
+            eventBuilder.withRelease(null);
+        }
+
+        if (event.hasKey("dist")) {
+            eventBuilder.withDist(event.getString("dist"));
+        } else {
+            eventBuilder.withDist(null);
+        }
+
+        Event builtEvent = eventBuilder.build();
+
+        if (event.hasKey("sdk")) {
+            ReadableNativeMap sdk = (ReadableNativeMap)event.getMap("sdk");
+            Set<String> sdkIntegrations = new HashSet<>();
+            if (sdk.hasKey("integrations")) {
+                ReadableNativeArray integrations = (ReadableNativeArray)sdk.getArray("integrations");
+                for(int i = 0; i < integrations.size(); ++i) {
+                    sdkIntegrations.add(integrations.getString(i));
+                }
             }
         } catch (Exception e) {
             logger.info("Error reading envelope");
