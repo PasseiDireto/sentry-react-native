@@ -6,6 +6,9 @@
   "description": "Official Sentry SDK for react-native",
   "typings": "dist/js/index.d.ts",
   "types": "dist/js/index.d.ts",
+  "engines": {
+        "node": ">=12.0.0"
+  },
   "typescript": {
     "definition": "dist/js/index.d.ts"
   },
